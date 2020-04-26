@@ -1,8 +1,3 @@
-// ttfm
-// ~~~~
-//
-// Time to first merge. Takes a path to a bunch of gerrit-managed git repos
-// and a username and finds that user's first contribution.
 package main
 
 import (
@@ -13,16 +8,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-)
-
-var (
-	repos       string
-	userPattern string
-	debug       bool
 )
 
 type change struct {
@@ -34,15 +24,38 @@ type change struct {
 	has_commit bool
 }
 
+type changeDuration struct {
+	change   change
+	duration time.Duration
+}
+
+var (
+	repos        string
+	sqlitePath   string
+	debug        bool
+	authors      = map[string]change{}
+	gitLogFormat = []string{
+		"%at", // 0 authorTime
+		"%aN", // 1 authorName
+		"%aE", // 2 authorEmail
+		"%H",  //  3 commit_hash
+		"%(trailers:key=Bug,separator=%x2C,valueonly=on)", // 4 bug
+		"%D",  // 5 refs
+		"%ct", // 6 commiter time
+		"%cE", // 7 commiter_email
+		"%cN", // 8 committer_name
+	}
+)
+
 func parseArgs() {
 	reposUsage := "Path to git repositories"
 	defaultRepos := "."
 	flag.StringVar(&repos, "repos", defaultRepos, reposUsage)
 	flag.StringVar(&repos, "r", defaultRepos, reposUsage+" (shorthand)")
 
-	userUsage := "Pattern of users to search for"
-	flag.StringVar(&userPattern, "users", "", userUsage)
-	flag.StringVar(&userPattern, "u", "", userUsage+" (shorthand)")
+	sqlUsage := "Path to sqlitedb"
+	flag.StringVar(&sqlitePath, "sqlite", "", sqlUsage)
+	flag.StringVar(&sqlitePath, "s", "", sqlUsage+" (shorthand)")
 
 	debugUsage := "Increase verbosity of output"
 	flag.BoolVar(&debug, "verbose", false, debugUsage)
@@ -62,55 +75,97 @@ func findGitDirs() ([]string, error) {
 	return gitDirs, err
 }
 
-func gitGrep(repo string) change {
-	out, err := exec.Command("git", "-C", repo, "log", "--glob=heads", "--format=%aN\t%H\t%at\t%D", fmt.Sprintf("--author=%s", userPattern), "--extended-regexp", "--regexp-ignore-case", "--reverse").CombinedOutput()
-	oldest_change := change{repo: repo}
-	if len(out) > 0 && err == nil {
-		oldest_change.has_commit = true
-		commits := strings.Split(string(out), "\n")
-		oldest_commit := strings.Split(commits[0], "\t")
-		oldest_change.author = oldest_commit[0]
-		oldest_change.sha1 = oldest_commit[1]
-		if len(strings.TrimSpace(oldest_commit[3])) > 0 {
-			if strings.Contains(oldest_commit[3], ",") {
-				branches := strings.Split(oldest_commit[3], ",")
-				for _, branch := range branches {
-					branch = strings.TrimSpace(branch)
-					if strings.HasPrefix(branch, "refs/changes") {
-						oldest_change.refs = branch
-						break
-					}
-				}
-			} else {
-				oldest_change.refs = oldest_commit[3]
-			}
-		}
-		timestamp, err := strconv.ParseInt(oldest_commit[2], 10, 64)
-		if err != nil {
-			log.Fatal(err)
-		}
-		oldest_change.datetime = time.Unix(timestamp, 0)
+func repoName(repoPath string) string {
+	name, err := filepath.Rel(repos, repoPath)
+	if err != nil {
+		log.Fatal(err)
 	}
-	return oldest_change
+	return name
 }
 
-func findOldest(changes []change) change {
-	oldest := change{datetime: time.Now()}
-	for _, cl := range changes {
-		if cl.has_commit {
-			if cl.datetime.Before(oldest.datetime) {
-				oldest = cl
-			}
-		}
+func gitLogFmt(repo string) string {
+	null := "%x00"
+	var out strings.Builder
+	for _, v := range gitLogFormat {
+		fmt.Fprintf(&out, "%s%s", v, null)
 	}
-	return oldest
+	fmt.Fprintf(&out, "%s", repoName(repo))
+	return out.String()
 }
 
-// Find user's first commits across all repos
-func findFirstCommit(gitDirs []string) change {
+func gitLog(repo string) ([]string, error) {
+	cmd := []string{
+		"git",
+		"--no-pager",
+		"-C", repo,
+		"log",
+		"--glob=heads",
+		fmt.Sprintf("--format=%s", gitLogFmt(repo)),
+		"--author-date-order",
+	}
+	out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
+	if len(out) == 0 {
+		return []string{}, nil
+	}
+	if err != nil {
+		log.Fatalf("'%s' failed! %s", strings.Join(cmd, " "), err)
+	}
+	return strings.Split(strings.TrimSpace(string(out)), "\n"), err
+}
+
+// Create a Time object from a timestamp
+func timeFromUnix(unixEpoch string) time.Time {
+	timestamp, err := strconv.ParseInt(strings.TrimSpace(unixEpoch), 10, 64)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return time.Unix(timestamp, 0)
+}
+
+func refMetaFromGitLog(ref string) string {
+	return filepath.Join(filepath.Dir(ref), "meta")
+}
+
+// Make a meta ref from a ref
+func refFromGitLog(ref string) string {
+	if !strings.Contains(ref, "refs/changes") {
+		return ""
+	}
+
+	branches := strings.Split(ref, ",")
+	for _, branch := range branches {
+		branch = strings.TrimSpace(branch)
+		if strings.HasPrefix(branch, "refs/changes") {
+			return refMetaFromGitLog(branch)
+		}
+	}
+
+	return strings.TrimSpace(branches[0])
+}
+
+func parseGitLog(commits []string) {
+	for _, commit := range commits {
+		if commit == "" {
+			continue
+		}
+		commit_parts := strings.Split(commit, "\x00")
+		timestamp := timeFromUnix(commit_parts[0])
+		ref := refFromGitLog(commit_parts[5])
+		authors[commit_parts[2]] = change{
+			author:     commit_parts[1],
+			sha1:       commit_parts[3],
+			repo:       commit_parts[9],
+			datetime:   timestamp,
+			refs:       ref,
+			has_commit: true,
+		}
+	}
+}
+
+func sortedGitLog(gitDirs []string) []string {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.NumCPU()*4)
-	changes := []change{}
+	changes := []string{}
 	for _, repo := range gitDirs {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -120,34 +175,41 @@ func findFirstCommit(gitDirs []string) change {
 			}
 			defer func() { <-sem }()
 			defer wg.Done()
-			changes = append(changes, gitGrep(repo))
+			out, err := gitLog(repo)
+			if err != nil {
+				log.Fatalf("Repo '%s' failed with: %s", repo, err)
+			}
+			changes = append(changes, out...)
 		}(repo)
 	}
 
 	wg.Wait()
-	return findOldest(changes)
+	sort.Sort(sort.Reverse(sort.StringSlice(changes)))
+	return changes
 }
 
-func makeMetaBranch(changeRef string) string {
-	return filepath.Join(filepath.Dir(changeRef), "meta")
-}
-
-func ttfr(cl change) {
-	if len(cl.refs) > 0 {
-		metaBranch := makeMetaBranch(cl.refs)
-		out, err := exec.Command("git", "-C", cl.repo, "log", "--format=%at", "--grep=Status: merged", metaBranch).CombinedOutput()
-		if err != nil {
-			fmt.Println(cl)
-			log.Fatalf("ERROR: The command '%s' failed with: %s", fmt.Sprintf("git -C %s log --format='%at' --grep='Status: merged' %s", cl.repo, metaBranch), err)
-		}
-		merge_time, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("git -C '%s' show %s by '%s' at %v (%v)\n", cl.repo, cl.sha1, cl.author, cl.datetime, time.Unix(merge_time, 0).Sub(cl.datetime))
-	} else {
-		fmt.Printf("git -C '%s' show %s by '%s' at %v\n", cl.repo, cl.sha1, cl.author, cl.datetime)
+func getMergeTime(cl change) time.Time {
+	cmd := []string{
+		"git",
+		"-C",
+		filepath.Join(repos, cl.repo),
+		"log",
+		"--format=%at",
+		"--grep=Status: merged",
+		cl.refs,
 	}
+	out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
+	if err != nil {
+		fmt.Println(cl)
+		log.Fatalf(
+			"ERROR: The command '%s' failed with: %s",
+			strings.Join(cmd, " "),
+			err)
+	}
+	if string(out) == "" {
+		log.Fatalf("ERROR: The command '%s' failed", strings.Join(cmd, " "))
+	}
+	return timeFromUnix(string(out))
 }
 
 func main() {
@@ -156,5 +218,20 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	ttfr(findFirstCommit(gitDirs))
+	parseGitLog(sortedGitLog(gitDirs))
+	var records int64
+	var totalTime int64
+	for _, commit := range authors {
+		// Only show commits from the past 3 months
+		if commit.datetime.Before(time.Now().AddDate(0, -3, 0)) {
+			continue
+		}
+		if commit.refs == "" {
+			continue
+		}
+
+		totalTime += getMergeTime(commit).Sub(commit.datetime).Nanoseconds()
+		records += 1
+	}
+	fmt.Println(time.Duration(totalTime / records))
 }
