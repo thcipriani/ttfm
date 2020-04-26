@@ -1,46 +1,55 @@
 package main
 
 import (
+	"context"
+	"log"
 	"flag"
 	"fmt"
-	"log"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"strconv"
+        "sort"
 	"strings"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/elastic/go-elasticsearch/v8"
+	"github.com/elastic/go-elasticsearch/v8/esapi"
 )
 
 type change struct {
-	repo       string
-	sha1       string
-	datetime   time.Time
-	author     string
-	refs       string
-	has_commit bool
+	Repo           string    `json:"repo"`
+	Sha1           string    `json:"sha1"`
+	AuthorName     string    `json:"author_name"`
+	AuthorEmail    string    `json:"author_email"`
+	AuthorDate     time.Time `json:"author_date"`
+	CommitterName  string    `json:"committer_name"`
+	CommitterEmail string    `json:"committer_email"`
+	CommitterDate  time.Time `json:"committer_date"`
+	Refs           string    `json:"refs"`
+	MergeTime      int64     `json:"merge_time"`
+	Bug            string    `json:"bug"`
 }
 
 type changeDuration struct {
-	change   change
+	change change
 	duration time.Duration
 }
 
 var (
-	repos        string
-	sqlitePath   string
-	debug        bool
-	authors      = map[string]change{}
+	repos string
+	debug bool
+	authors = map[string]change{}
 	gitLogFormat = []string{
 		"%at", // 0 authorTime
 		"%aN", // 1 authorName
 		"%aE", // 2 authorEmail
-		"%H",  //  3 commit_hash
+		"%H", //  3 commit_hash
 		"%(trailers:key=Bug,separator=%x2C,valueonly=on)", // 4 bug
-		"%D",  // 5 refs
+		"%D", // 5 refs
 		"%ct", // 6 commiter time
 		"%cE", // 7 commiter_email
 		"%cN", // 8 committer_name
@@ -51,15 +60,11 @@ func parseArgs() {
 	reposUsage := "Path to git repositories"
 	defaultRepos := "."
 	flag.StringVar(&repos, "repos", defaultRepos, reposUsage)
-	flag.StringVar(&repos, "r", defaultRepos, reposUsage+" (shorthand)")
-
-	sqlUsage := "Path to sqlitedb"
-	flag.StringVar(&sqlitePath, "sqlite", "", sqlUsage)
-	flag.StringVar(&sqlitePath, "s", "", sqlUsage+" (shorthand)")
+	flag.StringVar(&repos, "r", defaultRepos, reposUsage + " (shorthand)")
 
 	debugUsage := "Increase verbosity of output"
 	flag.BoolVar(&debug, "verbose", false, debugUsage)
-	flag.BoolVar(&debug, "v", false, debugUsage+" (shorthand)")
+	flag.BoolVar(&debug, "v", false, debugUsage + " (shorthand)")
 
 	flag.Parse()
 }
@@ -104,7 +109,7 @@ func gitLog(repo string) ([]string, error) {
 		"--author-date-order",
 	}
 	out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
-	if len(out) == 0 {
+	if (len(out) == 0) {
 		return []string{}, nil
 	}
 	if err != nil {
@@ -128,14 +133,14 @@ func refMetaFromGitLog(ref string) string {
 
 // Make a meta ref from a ref
 func refFromGitLog(ref string) string {
-	if !strings.Contains(ref, "refs/changes") {
+	if (! strings.Contains(ref, "refs/changes")) {
 		return ""
 	}
 
 	branches := strings.Split(ref, ",")
 	for _, branch := range branches {
 		branch = strings.TrimSpace(branch)
-		if strings.HasPrefix(branch, "refs/changes") {
+		if (strings.HasPrefix(branch, "refs/changes")) {
 			return refMetaFromGitLog(branch)
 		}
 	}
@@ -145,32 +150,37 @@ func refFromGitLog(ref string) string {
 
 func parseGitLog(commits []string) {
 	for _, commit := range commits {
-		if commit == "" {
+		if (commit == "") {
 			continue
 		}
 		commit_parts := strings.Split(commit, "\x00")
-		timestamp := timeFromUnix(commit_parts[0])
+		authorTime := timeFromUnix(commit_parts[0])
+		commitTime := timeFromUnix(commit_parts[6])
 		ref := refFromGitLog(commit_parts[5])
-		authors[commit_parts[2]] = change{
-			author:     commit_parts[1],
-			sha1:       commit_parts[3],
-			repo:       commit_parts[9],
-			datetime:   timestamp,
-			refs:       ref,
-			has_commit: true,
+		authors[commit_parts[1]] = change{
+			AuthorName: commit_parts[1],
+			AuthorEmail: commit_parts[2],
+			AuthorDate: authorTime,
+			CommitterName: commit_parts[8],
+			CommitterEmail: commit_parts[7],
+			CommitterDate: commitTime,
+			Sha1: commit_parts[3],
+			Repo: commit_parts[9],
+			Bug: commit_parts[4],
+			Refs: ref,
 		}
 	}
 }
 
 func sortedGitLog(gitDirs []string) []string {
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.NumCPU()*4)
+	sem := make(chan struct{}, runtime.NumCPU() * 4)
 	changes := []string{}
 	for _, repo := range gitDirs {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(repo string) {
-			if debug {
+			if (debug) {
 				fmt.Printf("Checking '%s'\n", repo)
 			}
 			defer func() { <-sem }()
@@ -189,14 +199,14 @@ func sortedGitLog(gitDirs []string) []string {
 }
 
 func getMergeTime(cl change) time.Time {
-	cmd := []string{
+        cmd := []string{
 		"git",
 		"-C",
-		filepath.Join(repos, cl.repo),
+		filepath.Join(repos, cl.Repo),
 		"log",
 		"--format=%at",
 		"--grep=Status: merged",
-		cl.refs,
+		cl.Refs,
 	}
 	out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
 	if err != nil {
@@ -219,19 +229,43 @@ func main() {
 		log.Fatal(err)
 	}
 	parseGitLog(sortedGitLog(gitDirs))
-	var records int64
-	var totalTime int64
+	es, err := elasticsearch.NewDefaultClient()
+	if err != nil {
+		log.Fatalf("Error creating the client: %s", err)
+	}
+        i := 0
 	for _, commit := range authors {
 		// Only show commits from the past 3 months
-		if commit.datetime.Before(time.Now().AddDate(0, -3, 0)) {
+		// if commit.AuthorDate.Before(time.Now().AddDate(0, -3, 0)) {
+		// 	continue
+		// }
+		if commit.Refs == "" {
 			continue
 		}
-		if commit.refs == "" {
-			continue
+		commit.MergeTime = getMergeTime(commit).Sub(commit.AuthorDate).Milliseconds()
+		body, err := json.Marshal(commit)
+		if err != nil {
+			log.Fatal(err)
 		}
+		// Set up the request object.
+		req := esapi.IndexRequest{
+			Index:      "ttfm",
+			DocumentID: strconv.Itoa(i + 1),
+			Body:       strings.NewReader(string(body)),
+			Refresh:    "true",
+	        }
 
-		totalTime += getMergeTime(commit).Sub(commit.datetime).Nanoseconds()
-		records += 1
+		// Perform the request with the client.
+		res, err := req.Do(context.Background(), es)
+		if err != nil {
+			log.Fatalf("Error getting response: %s", err)
+		}
+		defer res.Body.Close()
+		if res.IsError() {
+			log.Printf("[%s] Error indexing document ID=%d", res.Status(), i+1)
+		} else {
+			fmt.Println(string(body))
+		}
+		i++
 	}
-	fmt.Println(time.Duration(totalTime / records))
 }

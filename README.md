@@ -6,4 +6,8 @@ ttfm
 ## Usage
 
     $ ttfm -repos src
-    131h7m6.43902439s
+
+## Dependencies
+
+This expects there to be an elasticsearch instance running on the localhost
+with default config. I should do better than that, but I haven't.
